@@ -27,6 +27,9 @@ type ClientConfig struct {
 	Server                   M.Socksaddr
 	Dialer                   N.Dialer
 	TLSConfig                *vmess.TLSConfig
+	// Dial 非空时表示底层流由外部传输提供（LightXtreme lx-xhttp），
+	// 此时 anytls 不再自行建立 TLS 连接。
+	Dial func(ctx context.Context) (net.Conn, error)
 }
 
 type Client struct {
@@ -34,17 +37,23 @@ type Client struct {
 	tlsConfig      *vmess.TLSConfig
 	dialer         N.Dialer
 	server         M.Socksaddr
+	dial           func(ctx context.Context) (net.Conn, error)
 	sessionClient  *session.Client
 	padding        atomic.Pointer[padding.PaddingFactory]
 }
 
 func NewClient(ctx context.Context, config ClientConfig) *Client {
 	pw := sha256.Sum256([]byte(config.Password))
+	// LightXtreme: 32 位 hex 口令走私有时间掩码变换
+	if lxPW, ok := lxPasswordSHA256(config.Password); ok {
+		pw = lxPW
+	}
 	c := &Client{
 		passwordSha256: pw[:],
 		tlsConfig:      config.TLSConfig,
 		dialer:         config.Dialer,
 		server:         config.Server,
+		dial:           config.Dial,
 	}
 	// Initialize the padding state of this client
 	padding.UpdatePaddingScheme(padding.DefaultPaddingScheme, &c.padding)
@@ -66,7 +75,22 @@ func (c *Client) CreateProxy(ctx context.Context, destination M.Socksaddr) (net.
 }
 
 func (c *Client) createOutboundTLSConnection(ctx context.Context) (net.Conn, error) {
-	conn, err := c.dialer.DialContext(ctx, N.NetworkTCP, c.server)
+	var conn net.Conn
+	var err error
+	if c.dial != nil {
+		// 外部传输（LightXtreme lx-xhttp）已完成 TLS，直接给出流
+		conn, err = c.dial(ctx)
+	} else {
+		conn, err = c.dialer.DialContext(ctx, N.NetworkTCP, c.server)
+		if err == nil {
+			tlsConn, tlsErr := vmess.StreamTLSConn(ctx, conn, c.tlsConfig)
+			if tlsErr != nil {
+				_ = conn.Close()
+				return nil, tlsErr
+			}
+			conn = tlsConn
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -84,18 +108,12 @@ func (c *Client) createOutboundTLSConnection(ctx context.Context) (net.Conn, err
 		b.WriteZeroN(paddingLen)
 	}
 
-	tlsConn, err := vmess.StreamTLSConn(ctx, conn, c.tlsConfig)
+	_, err = b.WriteTo(conn)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
-
-	_, err = b.WriteTo(tlsConn)
-	if err != nil {
-		tlsConn.Close()
-		return nil, err
-	}
-	return tlsConn, nil
+	return conn, nil
 }
 
 func (h *Client) Close() error {

@@ -636,6 +636,49 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 			anytls["skip-cert-verify"] = insecureBool
 			anytls["udp"] = true
 
+			// LightXtreme / 闪连 私有 lx-xhttp 传输参数
+			transportType := query.Get("type")
+			if transportType == "" {
+				transportType = query.Get("transport")
+			}
+			if transportType == "lx-xhttp" || transportType == "xhttp" || transportType == "闪电旋风劈" {
+				transport := map[string]any{"type": "lx-xhttp"}
+				if value := query.Get("path"); value != "" {
+					transport["path"] = value
+				}
+				if value := query.Get("mode"); value != "" {
+					transport["mode"] = value
+				}
+				if value := query.Get("obfs-key"); value != "" {
+					transport["obfs-key"] = value
+				} else if value = query.Get("obfs_key"); value != "" {
+					transport["obfs-key"] = value
+				}
+				if value := query.Get("padding-min"); value != "" {
+					transport["padding-min"] = value
+				}
+				if value := query.Get("padding-max"); value != "" {
+					transport["padding-max"] = value
+				}
+				downloadServer := query.Get("download")
+				downloadPath := query.Get("download-path")
+				downloadPort := query.Get("download-port")
+				if downloadServer != "" || downloadPath != "" || downloadPort != "" {
+					download := map[string]any{}
+					if downloadServer != "" {
+						download["server"] = downloadServer
+					}
+					if downloadPath != "" {
+						download["path"] = downloadPath
+					}
+					if downloadPort != "" {
+						download["port"] = downloadPort
+					}
+					transport["download"] = download
+				}
+				anytls["transport"] = transport
+			}
+
 			proxies = append(proxies, anytls)
 
 		case "mierus":
