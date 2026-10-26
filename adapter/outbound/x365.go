@@ -44,6 +44,15 @@ type X365 struct {
 	tunnel *x365Tunnel
 }
 
+// tunnels caches one REALITY/h2 connection per (server, account). All 120 nodes
+// share a single server and uuid and only differ by h2 :path, so opening a
+// tunnel per node floods the server with handshakes and it stops answering.
+var tunnels sync.Map
+
+func tunnelKey(o *X365Option) string {
+	return o.Server + "|" + strconv.Itoa(o.Port) + "|" + o.UUID + "|" + o.PublicKey + "|" + o.ShortID + "|" + o.ServerName
+}
+
 type X365Option struct {
 	BasicOption
 	Name              string `proxy:"name"`
@@ -120,7 +129,7 @@ func (x *X365) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, e
 		if err != nil {
 			return nil, err
 		}
-		conn, err := t.open(host, uint16(metadata.DstPort))
+		conn, err := t.open(host, uint16(metadata.DstPort), x.option.Path, x.option.Host)
 		if err == nil {
 			log.Debugln("[x365] %s dial %s:%d ok (stream %d)", x.Name(), host, metadata.DstPort, conn.id)
 			return NewConn(conn, x), nil
@@ -135,38 +144,38 @@ func (x *X365) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, e
 }
 
 func (x *X365) getTunnel(ctx context.Context) (*x365Tunnel, error) {
-	x.mu.Lock()
-	if x.tunnel != nil && x.tunnel.alive() {
-		t := x.tunnel
-		x.mu.Unlock()
-		return t, nil
+	key := tunnelKey(x.option)
+	if v, ok := tunnels.Load(key); ok {
+		if t, ok2 := v.(*x365Tunnel); ok2 && t.alive() {
+			return t, nil
+		}
+		tunnels.Delete(key)
 	}
-	x.mu.Unlock()
 
+	// serialise handshakes per account so a burst of health checks does not
+	// start one REALITY connection per node
+	tunnelMu.Lock()
+	defer tunnelMu.Unlock()
+	if v, ok := tunnels.Load(key); ok {
+		if t, ok2 := v.(*x365Tunnel); ok2 && t.alive() {
+			return t, nil
+		}
+	}
 	t, err := x.dialTunnel(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	x.mu.Lock()
-	if x.tunnel != nil && x.tunnel.alive() {
-		// another goroutine won the race
-		old := x.tunnel
-		x.mu.Unlock()
-		t.close()
-		return old, nil
-	}
-	x.tunnel = t
-	x.mu.Unlock()
+	tunnels.Store(key, t)
 	return t, nil
 }
 
+var tunnelMu sync.Mutex
+
 func (x *X365) dropTunnel(t *x365Tunnel) {
-	x.mu.Lock()
-	if x.tunnel == t {
-		x.tunnel = nil
+	key := tunnelKey(x.option)
+	if v, ok := tunnels.Load(key); ok && v == t {
+		tunnels.Delete(key)
 	}
-	x.mu.Unlock()
 	t.close()
 }
 
@@ -281,7 +290,7 @@ func (t *x365Tunnel) writeFrame(typ, flags byte, stream uint32, p []byte) error 
 	return nil
 }
 
-func (t *x365Tunnel) headers() []byte {
+func (t *x365Tunnel) headers(path, authority string) []byte {
 	var hb []byte
 	enc := hpack.NewEncoder(writerFunc(func(p []byte) (int, error) {
 		hb = append(hb, p...)
@@ -289,8 +298,8 @@ func (t *x365Tunnel) headers() []byte {
 	}))
 	enc.WriteField(hpack.HeaderField{Name: ":method", Value: "POST"})
 	enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
-	enc.WriteField(hpack.HeaderField{Name: ":authority", Value: t.x.option.Host})
-	enc.WriteField(hpack.HeaderField{Name: ":path", Value: t.x.option.Path})
+	enc.WriteField(hpack.HeaderField{Name: ":authority", Value: authority})
+	enc.WriteField(hpack.HeaderField{Name: ":path", Value: path})
 	enc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
 	enc.WriteField(hpack.HeaderField{Name: "te", Value: "trailers"})
 	enc.WriteField(hpack.HeaderField{Name: "user-agent", Value: "grpc-go/1.70.0"})
@@ -326,7 +335,7 @@ func (t *x365Tunnel) handshake() error {
 	if err := t.writeFrame(0x8, 0, 0, inc); err != nil {
 		return err
 	}
-	if err := t.writeFrame(0x1, 0x4, 1, t.headers()); err != nil {
+	if err := t.writeFrame(0x1, 0x4, 1, t.headers(t.x.option.Path, t.x.option.Host)); err != nil {
 		return err
 	}
 	init := append([]byte("X365"), 0x01, 0x02)
@@ -335,7 +344,7 @@ func (t *x365Tunnel) handshake() error {
 	return t.writeFrame(0x0, 0, 1, init)
 }
 
-func (t *x365Tunnel) open(host string, port uint16) (*x365Conn, error) {
+func (t *x365Tunnel) open(host string, port uint16, path, authority string) (*x365Conn, error) {
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -347,7 +356,7 @@ func (t *x365Tunnel) open(host string, port uint16) (*x365Conn, error) {
 	t.streams[id] = sb
 	t.mu.Unlock()
 
-	if err := t.writeFrame(0x1, 0x4, id, t.headers()); err != nil {
+	if err := t.writeFrame(0x1, 0x4, id, t.headers(path, authority)); err != nil {
 		return nil, err
 	}
 	open := append([]byte("X365"), 0x01, 0x01)
