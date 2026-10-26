@@ -314,7 +314,16 @@ func (t *x365Tunnel) handshake() error {
 	if _, err := t.conn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")); err != nil {
 		return err
 	}
-	if err := t.writeFrame(0x4, 0, 0, nil); err != nil {
+	// advertise a large receive window so we do not have to top it up mid-transfer
+	settings := make([]byte, 6)
+	settings[0], settings[1] = 0x00, 0x04        // SETTINGS_INITIAL_WINDOW_SIZE
+	binary.BigEndian.PutUint32(settings[2:], 8*1024*1024)
+	if err := t.writeFrame(0x4, 0, 0, settings); err != nil {
+		return err
+	}
+	inc := make([]byte, 4)
+	binary.BigEndian.PutUint32(inc, 8*1024*1024)
+	if err := t.writeFrame(0x8, 0, 0, inc); err != nil {
 		return err
 	}
 	if err := t.writeFrame(0x1, 0x4, 1, t.headers()); err != nil {
@@ -389,11 +398,16 @@ func (t *x365Tunnel) readLoop() {
 				t.streamEOF(stream)
 				continue
 			}
-			// keep the server's flow-control window open
+			// keep the flow-control windows open
 			inc := make([]byte, 4)
 			binary.BigEndian.PutUint32(inc, uint32(n))
 			t.writeFrame(0x8, 0, 0, inc)
-			t.writeFrame(0x8, 0, stream, inc)
+			t.mu.Lock()
+			alive := t.streams[stream] != nil
+			t.mu.Unlock()
+			if alive {
+				t.writeFrame(0x8, 0, stream, inc)
+			}
 			if n >= 4 && string(p[:4]) == "X365" {
 				continue // control frame, never forward
 			}
