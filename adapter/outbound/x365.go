@@ -126,7 +126,9 @@ func (x *X365) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, e
 
 func (x *X365) dialTunnel(ctx context.Context) (*x365Tunnel, error) {
 	addr := net.JoinHostPort(x.option.Server, strconv.Itoa(x.option.Port))
-	raw, err := dialer.DialContext(ctx, "tcp", addr)
+	// honour interface / routing-mark / ipv6 preferences from the base option,
+	// otherwise the socket can bind to the TUN adapter and loop back into us
+	raw, err := dialer.DialContext(ctx, "tcp", addr, x.DialOptions()...)
 	if err != nil {
 		return nil, err
 	}
