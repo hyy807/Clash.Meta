@@ -18,6 +18,7 @@ import (
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	"golang.org/x/net/http2/hpack"
 )
 
@@ -121,8 +122,10 @@ func (x *X365) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, e
 		}
 		conn, err := t.open(host, uint16(metadata.DstPort))
 		if err == nil {
+			log.Debugln("[x365] %s dial %s:%d ok (stream %d)", x.Name(), host, metadata.DstPort, conn.id)
 			return NewConn(conn, x), nil
 		}
+		log.Warnln("[x365] %s dial %s:%d failed: %s", x.Name(), host, metadata.DstPort, err)
 		x.dropTunnel(t)
 		if attempt == 1 {
 			return nil, err
@@ -449,6 +452,19 @@ type x365Conn struct {
 	t  *x365Tunnel
 	id uint32
 	sb *x365Stream
+
+	dlMu     sync.Mutex
+	deadline time.Time
+}
+
+func (c *x365Conn) setDeadline(t time.Time) {
+	c.dlMu.Lock()
+	c.deadline = t
+	c.dlMu.Unlock()
+	select {
+	case c.sb.ch <- struct{}{}:
+	default:
+	}
 }
 
 func (c *x365Conn) Read(p []byte) (int, error) {
@@ -466,7 +482,24 @@ func (c *x365Conn) Read(p []byte) (int, error) {
 		if eof {
 			return 0, io.EOF
 		}
-		<-s.ch
+		c.dlMu.Lock()
+		dl := c.deadline
+		c.dlMu.Unlock()
+		if dl.IsZero() {
+			<-s.ch
+			continue
+		}
+		d := time.Until(dl)
+		if d <= 0 {
+			return 0, os.ErrDeadlineExceeded
+		}
+		timer := time.NewTimer(d)
+		select {
+		case <-s.ch:
+			timer.Stop()
+		case <-timer.C:
+			return 0, os.ErrDeadlineExceeded
+		}
 	}
 }
 
@@ -487,6 +520,6 @@ func (c *x365Conn) Close() error {
 
 func (c *x365Conn) LocalAddr() net.Addr                { return c.t.conn.LocalAddr() }
 func (c *x365Conn) RemoteAddr() net.Addr               { return c.t.conn.RemoteAddr() }
-func (c *x365Conn) SetDeadline(t time.Time) error      { return nil }
-func (c *x365Conn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *x365Conn) SetDeadline(t time.Time) error      { c.setDeadline(t); return nil }
+func (c *x365Conn) SetReadDeadline(t time.Time) error  { c.setDeadline(t); return nil }
 func (c *x365Conn) SetWriteDeadline(t time.Time) error { return nil }
