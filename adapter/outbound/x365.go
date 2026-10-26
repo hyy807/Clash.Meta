@@ -218,6 +218,7 @@ func (x *X365) dialTunnel(ctx context.Context) (*x365Tunnel, error) {
 		x:       x,
 		streams: map[uint32]*x365Stream{},
 		nextID:  3,
+		sem:     make(chan struct{}, 200),
 	}
 	if err := t.handshake(); err != nil {
 		tlsConn.Close()
@@ -263,6 +264,11 @@ type x365Tunnel struct {
 	streams map[uint32]*x365Stream
 	nextID  uint32
 	closed  bool
+
+	// the server caps concurrent streams; a burst of 120 health checks opening
+	// streams at once makes it answer GOAWAY and kills the shared tunnel, so
+	// opens are queued instead of fired blindly
+	sem chan struct{}
 }
 
 func (t *x365Tunnel) alive() bool {
@@ -345,6 +351,11 @@ func (t *x365Tunnel) handshake() error {
 }
 
 func (t *x365Tunnel) open(host string, port uint16, path, authority string) (*x365Conn, error) {
+	select {
+	case t.sem <- struct{}{}:
+	case <-time.After(20 * time.Second):
+		return nil, errors.New("x365: too many concurrent streams")
+	}
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -357,6 +368,7 @@ func (t *x365Tunnel) open(host string, port uint16, path, authority string) (*x3
 	t.mu.Unlock()
 
 	if err := t.writeFrame(0x1, 0x4, id, t.headers(path, authority)); err != nil {
+		<-t.sem
 		return nil, err
 	}
 	open := append([]byte("X365"), 0x01, 0x01)
@@ -377,9 +389,10 @@ func (t *x365Tunnel) open(host string, port uint16, path, authority string) (*x3
 	}
 	x365Debug("open %s:%d on stream %d", host, port, id)
 	if err := t.writeFrame(0x0, 0, id, open); err != nil {
+		<-t.sem
 		return nil, err
 	}
-	return &x365Conn{t: t, id: id, sb: sb}, nil
+	return &x365Conn{t: t, id: id, sb: sb, release: sync.Once{}}, nil
 }
 
 func (t *x365Tunnel) readLoop() {
@@ -472,9 +485,10 @@ func (t *x365Tunnel) shutdown() {
 func (t *x365Tunnel) close() { t.shutdown() }
 
 type x365Conn struct {
-	t  *x365Tunnel
-	id uint32
-	sb *x365Stream
+	t       *x365Tunnel
+	id      uint32
+	sb      *x365Stream
+	release sync.Once
 
 	dlMu     sync.Mutex
 	deadline time.Time
@@ -534,10 +548,27 @@ func (c *x365Conn) Write(p []byte) (int, error) {
 }
 
 // Close ends only this h2 stream; the shared tunnel stays up for other dials.
+// RST_STREAM is mandatory: without it the server keeps the stream open and its
+// flow-control window is never returned, so after a few hundred health checks
+// the whole connection stalls and every node reports EOF.
 func (c *x365Conn) Close() error {
 	c.t.mu.Lock()
+	_, existed := c.t.streams[c.id]
 	delete(c.t.streams, c.id)
+	closed := c.t.closed
 	c.t.mu.Unlock()
+	if existed && !closed {
+		code := make([]byte, 4)
+		binary.BigEndian.PutUint32(code, 0x8) // CANCEL
+		c.t.writeFrame(0x3, 0, c.id, code)
+	}
+	c.sb.finish()
+	c.release.Do(func() {
+		select {
+		case <-c.t.sem:
+		default:
+		}
+	})
 	return nil
 }
 
