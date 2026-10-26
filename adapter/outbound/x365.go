@@ -277,8 +277,20 @@ func (t *x365Tunnel) open(host string, port uint16) (*x365Conn, error) {
 	time.Sleep(150 * time.Millisecond)
 	open := append([]byte("X365"), 0x01, 0x01)
 	open = append(open, t.x.uuid...)
-	open = append(open, byte(port>>8), byte(port), 0x02, byte(len(host)))
-	open = append(open, []byte(host)...)
+	open = append(open, byte(port>>8), byte(port))
+	// address type: 0x01 = IPv4, 0x03 = IPv6, 0x02 = domain
+	if ip := net.ParseIP(host); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			open = append(open, 0x01)
+			open = append(open, v4...)
+		} else {
+			open = append(open, 0x03)
+			open = append(open, ip.To16()...)
+		}
+	} else {
+		open = append(open, 0x02, byte(len(host)))
+		open = append(open, []byte(host)...)
+	}
 	x365Debug("open %s:%d on stream %d", host, port, t.id)
 	if err := t.writeFrame(0x0, 0, t.id, open); err != nil {
 		return nil, err
