@@ -3,15 +3,14 @@ package outbound
 import (
 	"context"
 	"crypto/ecdh"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -23,21 +22,25 @@ import (
 )
 
 // X365 is the efanyun (protocolabs) tunnel, reverse engineered from
-// libprotocolabs_mobile.so and verified against the live server:
+// libprotocolabs_mobile.so and verified against the live node:
 //
 //	REALITY TLS -> HTTP/2 (one stream per proxied connection) -> "X365" frames
 //
 //	init : "X365" 01 02 uuid16 00 35 01 01 01 01 01   (stream 1, once per tunnel)
-//	open : "X365" 01 01 uuid16 port:2 02 len host     (first DATA of each stream)
-//	ack  : "X365" 00                                  (control, must be filtered)
+//	open : "X365" 01 01 uuid16 port:2 atyp addr       (first DATA of each stream)
+//	ack  : "X365" 00                                  (control, filtered out)
 //	data : raw bytes inside h2 DATA frames
 //
-// The server replenishes nothing: the client must send WINDOW_UPDATE or transfers
-// stall at the initial 64 KiB window.
+// The REALITY handshake costs 1-3s, so one tunnel is shared by every proxied
+// connection and each dial only opens a new h2 stream (that is what the vendor
+// app does, and it keeps the latency checks inside their timeout).
 type X365 struct {
 	*Base
 	option *X365Option
 	uuid   []byte
+
+	mu     sync.Mutex
+	tunnel *x365Tunnel
 }
 
 type X365Option struct {
@@ -79,7 +82,7 @@ func NewX365(option X365Option) (*X365, error) {
 		option.ClientFingerprint = "chrome"
 	}
 	addr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
-	x := &X365{
+	return &X365{
 		Base: NewBase(BaseOption{
 			Name:         option.Name,
 			Addr:         addr,
@@ -93,8 +96,7 @@ func NewX365(option X365Option) (*X365, error) {
 		}),
 		option: &option,
 		uuid:   uuidBin[:16],
-	}
-	return x, nil
+	}, nil
 }
 
 func stripDashes(s string) string {
@@ -112,60 +114,98 @@ func (x *X365) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, e
 	if host == "" {
 		host = metadata.DstIP.String()
 	}
+	for attempt := 0; attempt < 2; attempt++ {
+		t, err := x.getTunnel(ctx)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := t.open(host, uint16(metadata.DstPort))
+		if err == nil {
+			return NewConn(conn, x), nil
+		}
+		x.dropTunnel(t)
+		if attempt == 1 {
+			return nil, err
+		}
+	}
+	return nil, errors.New("x365: dial failed")
+}
+
+func (x *X365) getTunnel(ctx context.Context) (*x365Tunnel, error) {
+	x.mu.Lock()
+	if x.tunnel != nil && x.tunnel.alive() {
+		t := x.tunnel
+		x.mu.Unlock()
+		return t, nil
+	}
+	x.mu.Unlock()
+
 	t, err := x.dialTunnel(ctx)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := t.open(host, uint16(metadata.DstPort))
-	if err != nil {
+
+	x.mu.Lock()
+	if x.tunnel != nil && x.tunnel.alive() {
+		// another goroutine won the race
+		old := x.tunnel
+		x.mu.Unlock()
 		t.close()
-		return nil, err
+		return old, nil
 	}
-	return NewConn(conn, x), nil
+	x.tunnel = t
+	x.mu.Unlock()
+	return t, nil
+}
+
+func (x *X365) dropTunnel(t *x365Tunnel) {
+	x.mu.Lock()
+	if x.tunnel == t {
+		x.tunnel = nil
+	}
+	x.mu.Unlock()
+	t.close()
 }
 
 func (x *X365) dialTunnel(ctx context.Context) (*x365Tunnel, error) {
-	addr := net.JoinHostPort(x.option.Server, strconv.Itoa(x.option.Port))
-	// honour interface / routing-mark / ipv6 preferences from the base option,
-	// otherwise the socket can bind to the TUN adapter and loop back into us
-	raw, err := dialer.DialContext(ctx, "tcp", addr, x.DialOptions()...)
-	if err != nil {
-		return nil, err
-	}
 	pbk, err := base64.RawURLEncoding.DecodeString(x.option.PublicKey)
 	if err != nil {
-		raw.Close()
 		return nil, fmt.Errorf("x365: bad public key: %w", err)
 	}
 	pub, err := ecdh.X25519().NewPublicKey(pbk)
 	if err != nil {
-		raw.Close()
 		return nil, fmt.Errorf("x365: bad public key: %w", err)
 	}
 	realityCfg := &tls.RealityConfig{PublicKey: pub}
 	if x.option.ShortID != "" {
 		sid, err := hex.DecodeString(x.option.ShortID)
 		if err != nil {
-			raw.Close()
 			return nil, fmt.Errorf("x365: bad short id: %w", err)
 		}
 		copy(realityCfg.ShortID[:], sid)
 	}
 	fp, ok := tls.GetFingerprint(x.option.ClientFingerprint)
 	if !ok {
-		raw.Close()
 		return nil, fmt.Errorf("x365: unknown fingerprint %q", x.option.ClientFingerprint)
 	}
-	tlsConn, err := tls.GetRealityConn(ctx, raw, fp, x.option.ServerName, realityCfg)
+	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	// honour interface / routing-mark / ip-stack preferences from the base option
+	raw, err := dialer.DialContext(dialCtx, "tcp", x.Addr(), x.DialOptions()...)
+	if err != nil {
+		return nil, fmt.Errorf("x365: connect %s: %w", x.Addr(), err)
+	}
+	tlsConn, err := tls.GetRealityConn(dialCtx, raw, fp, x.option.ServerName, realityCfg)
 	if err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("x365: reality handshake: %w", err)
 	}
-	x365Debug("reality ok -> %s", addr)
+	x365Debug("reality ok -> %s", x.Addr())
 	t := &x365Tunnel{
-		conn: tlsConn,
-		x:    x,
-		sb:   &x365Stream{ch: make(chan struct{}, 1)},
+		conn:    tlsConn,
+		x:       x,
+		streams: map[uint32]*x365Stream{},
+		nextID:  3,
 	}
 	if err := t.handshake(); err != nil {
 		tlsConn.Close()
@@ -205,9 +245,18 @@ func (s *x365Stream) finish() {
 type x365Tunnel struct {
 	conn net.Conn
 	x    *X365
-	sb   *x365Stream
 	wmu  sync.Mutex
-	id   uint32
+
+	mu      sync.Mutex
+	streams map[uint32]*x365Stream
+	nextID  uint32
+	closed  bool
+}
+
+func (t *x365Tunnel) alive() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return !t.closed
 }
 
 func (t *x365Tunnel) writeFrame(typ, flags byte, stream uint32, p []byte) error {
@@ -256,6 +305,9 @@ type writerFunc func([]byte) (int, error)
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 func (t *x365Tunnel) handshake() error {
+	if err := t.conn.SetDeadline(time.Now().Add(10 * time.Second)); err == nil {
+		defer t.conn.SetDeadline(time.Time{})
+	}
 	if _, err := t.conn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")); err != nil {
 		return err
 	}
@@ -272,11 +324,20 @@ func (t *x365Tunnel) handshake() error {
 }
 
 func (t *x365Tunnel) open(host string, port uint16) (*x365Conn, error) {
-	t.id = 3
-	if err := t.writeFrame(0x1, 0x4, t.id, t.headers()); err != nil {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil, errors.New("x365: tunnel closed")
+	}
+	id := t.nextID
+	t.nextID += 2
+	sb := &x365Stream{ch: make(chan struct{}, 1)}
+	t.streams[id] = sb
+	t.mu.Unlock()
+
+	if err := t.writeFrame(0x1, 0x4, id, t.headers()); err != nil {
 		return nil, err
 	}
-	time.Sleep(150 * time.Millisecond)
 	open := append([]byte("X365"), 0x01, 0x01)
 	open = append(open, t.x.uuid...)
 	open = append(open, byte(port>>8), byte(port))
@@ -293,19 +354,18 @@ func (t *x365Tunnel) open(host string, port uint16) (*x365Conn, error) {
 		open = append(open, 0x02, byte(len(host)))
 		open = append(open, []byte(host)...)
 	}
-	x365Debug("open %s:%d on stream %d", host, port, t.id)
-	if err := t.writeFrame(0x0, 0, t.id, open); err != nil {
+	x365Debug("open %s:%d on stream %d", host, port, id)
+	if err := t.writeFrame(0x0, 0, id, open); err != nil {
 		return nil, err
 	}
-	time.Sleep(400 * time.Millisecond)
-	return &x365Conn{t: t}, nil
+	return &x365Conn{t: t, id: id, sb: sb}, nil
 }
 
 func (t *x365Tunnel) readLoop() {
 	h := make([]byte, 9)
 	for {
 		if _, err := io.ReadFull(t.conn, h); err != nil {
-			t.sb.finish()
+			t.shutdown()
 			return
 		}
 		n := int(h[0])<<16 | int(h[1])<<8 | int(h[2])
@@ -315,16 +375,15 @@ func (t *x365Tunnel) readLoop() {
 		if n > 0 {
 			p = make([]byte, n)
 			if _, err := io.ReadFull(t.conn, p); err != nil {
-				t.sb.finish()
+				t.shutdown()
 				return
 			}
 		}
 		x365Debug("rx frame type=%d flags=%d stream=%d len=%d %x", typ, h[4], stream, n, p)
 		switch typ {
 		case 0x0: // DATA
-			x365Debug("rx DATA stream=%d len=%d", stream, n)
 			if n == 0 {
-				t.sb.finish()
+				t.streamEOF(stream)
 				continue
 			}
 			// keep the server's flow-control window open
@@ -335,23 +394,65 @@ func (t *x365Tunnel) readLoop() {
 			if n >= 4 && string(p[:4]) == "X365" {
 				continue // control frame, never forward
 			}
-			t.sb.push(p)
+			t.streamData(stream, p)
 		case 0x4: // SETTINGS
 			if h[4]&0x1 == 0 { // only ACK a real SETTINGS, never an ACK
 				t.writeFrame(0x4, 0x1, 0, nil)
 			}
+		case 0x3: // RST_STREAM
+			t.streamEOF(stream)
+		case 0x7: // GOAWAY
+			t.shutdown()
+			return
 		}
 	}
 }
 
-func (t *x365Tunnel) close() { t.conn.Close() }
+func (t *x365Tunnel) streamData(id uint32, p []byte) {
+	t.mu.Lock()
+	sb := t.streams[id]
+	t.mu.Unlock()
+	if sb != nil {
+		sb.push(p)
+	}
+}
+
+func (t *x365Tunnel) streamEOF(id uint32) {
+	t.mu.Lock()
+	sb := t.streams[id]
+	delete(t.streams, id)
+	t.mu.Unlock()
+	if sb != nil {
+		sb.finish()
+	}
+}
+
+func (t *x365Tunnel) shutdown() {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.closed = true
+	streams := t.streams
+	t.streams = map[uint32]*x365Stream{}
+	t.mu.Unlock()
+	t.conn.Close()
+	for _, sb := range streams {
+		sb.finish()
+	}
+}
+
+func (t *x365Tunnel) close() { t.shutdown() }
 
 type x365Conn struct {
-	t *x365Tunnel
+	t  *x365Tunnel
+	id uint32
+	sb *x365Stream
 }
 
 func (c *x365Conn) Read(p []byte) (int, error) {
-	s := c.t.sb
+	s := c.sb
 	for {
 		s.mu.Lock()
 		if len(s.buf) > 0 {
@@ -370,18 +471,22 @@ func (c *x365Conn) Read(p []byte) (int, error) {
 }
 
 func (c *x365Conn) Write(p []byte) (int, error) {
-	if err := c.t.writeFrame(0x0, 0, c.t.id, p); err != nil {
+	if err := c.t.writeFrame(0x0, 0, c.id, p); err != nil {
 		return 0, err
 	}
 	return len(p), nil
 }
 
-func (c *x365Conn) Close() error                       { return c.t.conn.Close() }
+// Close ends only this h2 stream; the shared tunnel stays up for other dials.
+func (c *x365Conn) Close() error {
+	c.t.mu.Lock()
+	delete(c.t.streams, c.id)
+	c.t.mu.Unlock()
+	return nil
+}
+
 func (c *x365Conn) LocalAddr() net.Addr                { return c.t.conn.LocalAddr() }
 func (c *x365Conn) RemoteAddr() net.Addr               { return c.t.conn.RemoteAddr() }
-func (c *x365Conn) SetDeadline(t time.Time) error      { return c.t.conn.SetDeadline(t) }
-func (c *x365Conn) SetReadDeadline(t time.Time) error  { return c.t.conn.SetReadDeadline(t) }
-func (c *x365Conn) SetWriteDeadline(t time.Time) error { return c.t.conn.SetWriteDeadline(t) }
-
-// ensure the uuid is random-safe even if the account uuid is all zeros
-var _ = rand.Reader
+func (c *x365Conn) SetDeadline(t time.Time) error      { return nil }
+func (c *x365Conn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *x365Conn) SetWriteDeadline(t time.Time) error { return nil }
