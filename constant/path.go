@@ -53,6 +53,7 @@ var Path = func() *path {
 
 type path struct {
 	homeDir         string
+	cacheFile       string
 	configFile      string
 	allowUnsafePath bool
 	safePaths       []string
@@ -187,7 +188,15 @@ func (p *path) OldCache() string {
 	return P.Join(p.homeDir, ".cache")
 }
 
+// SetCache selects the cache independently of provider and asset paths.
+func SetCache(file string) {
+	Path.cacheFile = file
+}
+
 func (p *path) Cache() string {
+	if p.cacheFile != "" {
+		return p.cacheFile
+	}
 	return P.Join(p.homeDir, "cache.db")
 }
 
