@@ -2,17 +2,22 @@ package xhttp
 
 import (
 	"bytes"
+	"encoding/json"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"unicode/utf8"
 	"time"
 
 	"github.com/metacubex/mihomo/common/contextutils"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/common/httputils"
 
 	"github.com/metacubex/http"
@@ -339,6 +344,40 @@ func (c *Client) getTransport() (uploadTransport http.RoundTripper, downloadTran
 	return
 }
 
+
+// applyX365Auth 从 X365_AUTH_FILE 读取客户端实时签名并注入请求头。
+func applyX365Auth(req *http.Request) {
+	path := os.Getenv("X365_AUTH_FILE")
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var v struct {
+		Did  string `json:"did"`
+		Sig  string `json:"sig"`
+		IP   string `json:"ip"`
+		Auth string `json:"auth"`
+	}
+	if json.Unmarshal(data, &v) != nil {
+		return
+	}
+	if v.Did != "" {
+		req.Header.Set("x-did", v.Did)
+	}
+	if v.Sig != "" {
+		req.Header.Set("x-sig", v.Sig)
+	}
+	if v.Auth != "" {
+		req.Header.Set("Authorization", v.Auth)
+	}
+	if v.IP != "" {
+		req.Header.Set("x-client-ip", v.IP)
+	}
+}
+
 func (c *Client) DialStreamOne(ctx context.Context) (net.Conn, error) {
 	transport, _, err := c.getTransport()
 	if err != nil {
@@ -349,6 +388,17 @@ func (c *Client) DialStreamOne(ctx context.Context) (net.Conn, error) {
 		Scheme: "https",
 		Host:   c.cfg.Host,
 		Path:   c.cfg.NormalizedPath(),
+	}
+	if key := c.cfg.XPaddingKey; key != "" {
+		if pb, err := c.cfg.GetNormalizedXPaddingBytes(); err == nil {
+			q := requestURL.Query()
+			pad := GeneratePadding(PaddingMethod(c.cfg.XPaddingMethod), pb.Rand())
+			if os.Getenv("X365_PAD_PREFIX") != "" {
+				pad = os.Getenv("X365_PAD_PREFIX") + pad
+			}
+			_ = q
+			requestURL.RawQuery = key + "=" + pad
+		}
 	}
 	pr, pw := io.Pipe()
 
@@ -392,6 +442,26 @@ func (c *Client) DialStreamOne(ctx context.Context) (net.Conn, error) {
 		reqCancel()
 		return nil, err
 	}
+	applyX365Auth(req)
+	// latin1 体编码:每字节按码点转 UTF-8 发送,响应侧做反向解码
+	latin1Body := strings.EqualFold(req.Header.Get("x-protocolabs-body-encoding"), "latin1")
+	if latin1Body {
+		conn.writer = &latin1Writer{w: pw}
+	}
+
+	// vendor 风格:发送前剥离成最小头集合("[Request] stripped headers")
+	if os.Getenv("X365_STRIP") != "" {
+		keep := map[string]bool{
+			"user-agent": true, "accept-language": true,
+			"x-protocolabs-body-encoding": true, "x-sig": true, "x-did": true,
+			"authorization": true, "x-client-ip": true,
+		}
+		for k := range req.Header {
+			if !keep[strings.ToLower(k)] {
+				req.Header.Del(k)
+			}
+		}
+	}
 
 	wrc := NewWaitReadCloser()
 
@@ -402,7 +472,11 @@ func (c *Client) DialStreamOne(ctx context.Context) (net.Conn, error) {
 			close(gotConn)
 			return
 		}
+		log.Debugln("[x365dbg] %s %s -> %s srv=%s ct=%s", req.Method, req.URL.String(), resp.Status, resp.Header.Get("Server"), resp.Header.Get("Content-Type"))
+	log.Debugln("[x365dbg] reqh=%v", req.Header)
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
+			log.Debugln("[x365dbg] body=%q headers=%v", string(body), resp.Header)
 			_ = resp.Body.Close()
 			wrc.CloseWithError(fmt.Errorf("xhttp stream-one bad status: %s", resp.Status))
 			return
@@ -422,6 +496,9 @@ func (c *Client) DialStreamOne(ctx context.Context) (net.Conn, error) {
 	}
 
 	conn.reader = wrc
+	if latin1Body {
+		conn.reader = &latin1Reader{r: wrc}
+	}
 	conn.onClose = func() {
 		_ = pr.Close()
 		httputils.CloseTransport(transport)
@@ -527,6 +604,7 @@ func (c *Client) DialStreamUp(ctx context.Context) (net.Conn, error) {
 			close(gotConn)
 			return
 		}
+		log.Debugln("[x365dbg] DL %s %s -> %s", downloadReq.Method, downloadReq.URL.String(), resp.Status)
 		if resp.StatusCode != http.StatusOK {
 			_ = resp.Body.Close()
 			wrc.CloseWithError(fmt.Errorf("xhttp stream-up download bad status: %s", resp.Status))
@@ -731,6 +809,71 @@ func (w *WaitReadCloser) Close() error {
 	<-w.wait
 	if w.rc != nil {
 		return w.rc.Close()
+	}
+	return nil
+}
+
+type latin1Writer struct {
+	w io.Writer
+}
+
+func (l *latin1Writer) Write(b []byte) (int, error) {
+	var buf []byte
+	for _, c := range b {
+		buf = utf8.AppendRune(buf, rune(c))
+	}
+	if _, err := l.w.Write(buf); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+type latin1Reader struct {
+	r   io.Reader
+	buf []byte
+}
+
+func (l *latin1Reader) Read(p []byte) (int, error) {
+	if l.buf == nil {
+		var src [4096]byte
+		n, err := l.r.Read(src[:])
+		if n == 0 {
+			return 0, err
+		}
+		var out []byte
+		rest := src[:n]
+		for len(rest) > 0 {
+			r, sz := utf8.DecodeRune(rest)
+			if sz == 0 {
+				break
+			}
+			if r <= 0xFF {
+				out = append(out, byte(r))
+			} else {
+				out = append(out, byte(r), 0)
+			}
+			rest = rest[sz:]
+		}
+		l.buf = out
+	}
+	n := copy(p, l.buf)
+	l.buf = l.buf[n:]
+	if len(l.buf) == 0 {
+		l.buf = nil
+	}
+	return n, nil
+}
+
+func (l *latin1Writer) Close() error {
+	if c, ok := l.w.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+func (l *latin1Reader) Close() error {
+	if c, ok := l.r.(io.Closer); ok {
+		return c.Close()
 	}
 	return nil
 }

@@ -223,6 +223,29 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 
 			proxies = append(proxies, trojan)
 
+		case "x365":
+			// EFAN 专有分享链接：vless + xhttp + reality，URI 里没有 type/security
+			// 形如 x365://uuid@host:443?path=/ru81&host=cdn&sni=cdn&pbk=...&sid=...
+			urlX365, err := url.Parse(line)
+			if err != nil {
+				continue
+			}
+			queryX365 := urlX365.Query()
+			if queryX365.Get("type") == "" {
+				queryX365.Set("type", "xhttp")
+			}
+			if queryX365.Get("security") == "" {
+				queryX365.Set("security", "reality")
+			}
+			urlX365.RawQuery = queryX365.Encode()
+			vlessX365 := make(map[string]any, 20)
+			if err := handleVShareLink(names, urlX365, "vless", vlessX365); err != nil {
+				log.Warnln("error:%s line:%s", err.Error(), line)
+				continue
+			}
+			vlessX365["x365"] = true
+			proxies = append(proxies, vlessX365)
+
 		case "vless":
 			urlVLess, err := url.Parse(line)
 			if err != nil {

@@ -44,6 +44,9 @@ type DstAddr struct {
 type Client struct {
 	uuid   uuid.UUID
 	Addons *Addons
+	// X365 switches the request framing to the vendor's x365 header
+	// ("X365" magic + version + command + uuid + port + addr) instead of VLESS.
+	X365 bool
 }
 
 // StreamConn return a Conn with net.Conn and DstAddr

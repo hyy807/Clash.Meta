@@ -56,6 +56,7 @@ type Vless struct {
 }
 
 type VlessOption struct {
+	X365 bool `proxy:"x365,omitempty"` // vendor x365 framing over xhttp/reality
 	BasicOption
 	Name              string            `proxy:"name"`
 	Server            string            `proxy:"server"`
@@ -485,6 +486,9 @@ func NewVless(option VlessOption) (*Vless, error) {
 	}
 
 	client, err := vless.NewClient(option.UUID, addons)
+	if client != nil {
+		client.X365 = option.X365
+	}
 	if err != nil {
 		return nil, err
 	}
