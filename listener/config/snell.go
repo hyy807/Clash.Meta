@@ -6,7 +6,6 @@ type SnellServer struct {
 	Listen    string
 	Psk       string
 	Version   int
-	Mode      string // v6 only: default / unshaped / unsafe-raw
 	UDP       bool
 	ObfsMode  string
 	ObfsHost  string
